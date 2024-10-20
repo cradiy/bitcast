@@ -1,116 +1,107 @@
-
-
+use super::accessor::{BitAccessor, BitAdapter};
+use crate::error::*;
 macro_rules! read_any {
-    ($reader:expr, $len:expr, $ty:ty) => {
-        {
-            let mut bits = [false; $len];
-            let size = $reader.read(&mut bits);
-            if size != $len {
-                return None;
-            }
-            Some(
-                bits.into_iter()
-                    .rev()
-                    .enumerate()
-                    .map(|(i, b)| (b as $ty) << i)
-                    .sum(),
-            )
+    ($reader:expr, $len:expr, $ty:ty) => {{
+        let mut bits = [false; $len];
+        let size = $reader.read(&mut bits);
+        if size != $len {
+            return Err(Error::InvalidSize);
         }
-    };
+        Ok(bits
+            .into_iter()
+            .enumerate()
+            .fold(0, |out, (i, b)| out | (b as $ty) << i))
+    }};
 }
 pub trait BitRead {
     #[must_use]
     fn read(&mut self, buf: &mut [bool]) -> usize;
-    fn read_4bits(&mut self) -> Option<u8> {
+    fn read_bit(&mut self) -> Result<bool> {
+        let mut buf = [false; 1];
+        let size = self.read(&mut buf);
+        if size != 1 {
+            return Err(Error::InvalidSize);
+        }
+        Ok(buf[0])
+    }
+    fn read_4bits(&mut self) -> Result<u8> {
         read_any!(self, 4, u8)
     }
-    fn read_u8(&mut self) -> Option<u8> {
+    fn read_u8(&mut self) -> Result<u8> {
         read_any!(self, 8, u8)
     }
 }
 
-
-pub trait BitAccessor {
-    const BIT_SIZE: usize;
-    fn bit(&self, idx: usize) -> bool;
-}
-
-macro_rules! impl_bix {
-    ($($ty:ty), +) => {
+macro_rules! gen_bit_read_ext {
+    ($([$n:expr, $ty:ty, $fn_le:ident, $fn_be:ident]), +) => {
         $(
-            impl BitAccessor for $ty {
-                const BIT_SIZE: usize = std::mem::size_of::<$ty>() * 8;
-                fn bit(&self, idx: usize) -> bool {
-                    (*self & (1 << idx)) != 0
-                }
+            fn $fn_le(&mut self) -> Result<$ty> {
+                read_any!(self, $n, $ty)
+            }
+            fn $fn_be(&mut self) -> Result<$ty> {
+                self.$fn_le().map(|v| {
+                    let mut bytes = v.to_le_bytes();
+                    bytes.reverse();
+                    <$ty>::from_be_bytes(bytes)
+                })
             }
         ) +
     };
-}
-impl_bix!(u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize);
-impl BitAccessor for bool {
-    const BIT_SIZE: usize = 1;
-
-    fn bit(&self, idx: usize) -> bool {
-        idx == 0 && *self
-    }
-}
-pub trait BitStreamAdapter {
-    type Accessor;
-    fn accessor(&self) -> &[Self::Accessor];
-}
-macro_rules! impl_as_accessor {
-    (@impl $([$ty:ty, $accessor:ty]), +) => {
+    (@float $([$n:expr, $ty:ty, $fn_le:ident, $fn_be:ident]), +) => {
         $(
-            impl BitStreamAdapter for $ty {
-                type Accessor = $accessor;
-
-                fn accessor(&self) -> &[Self::Accessor] {
-                    self.as_ref()
+            fn $fn_le(&mut self) -> Result<$ty> {
+                self.$fn_be().map(|v| {
+                    let mut bytes = v.to_be_bytes();
+                    bytes.reverse();
+                    <$ty>::from_le_bytes(bytes)
+                })
+            }
+            fn $fn_be(&mut self) -> Result<$ty> {
+                let mut bytes = [0; $n / 8];
+                for b in &mut bytes {
+                    *b = self.read_u8()?;
                 }
+                Ok(<$ty>::from_be_bytes(bytes))
             }
         ) +
     };
-    ([$($ty:ty), +], $accessor:ty) => {
-        impl_as_accessor!(@impl $([$ty, $accessor]), +);
-    };
-    ($($ty:ty), +) => {
-        $(
-            impl<const N: usize> BitStreamAdapter for [$ty; N] {
-                type Accessor = $ty;
 
-                fn accessor(&self) -> &[Self::Accessor] {
-                    &self[..]
-                }
-            }
-            #[cfg(not(feature = "std"))]
-            impl_as_accessor!([&[$ty], [$ty]], $ty);
-            #[cfg(feature = "std")]
-            impl_as_accessor!([&[$ty], [$ty], ::std::vec::Vec<$ty>], $ty);
-        ) +
-    };
-    (@str $($ty:ty), +) => {
-        $(
-            impl BitStreamAdapter for $ty {
-                type Accessor = u8;
-                fn accessor(&self) -> &[Self::Accessor] {
-                    self.as_bytes()
-                }
-            }
-        ) +
-    }
 }
 
-impl_as_accessor!(u8, u16, u32, usize, u64, u128, i8, i16, i32, isize, i64, i128);
-impl_as_accessor!(@str str, &str, &&str);
-#[cfg(feature = "std")]
-impl_as_accessor!(@str &&::std::string::String, &::std::string::String, ::std::string::String);
+pub trait BitReadExt: BitRead {
+    gen_bit_read_ext!(
+        [16, u16, read_u16_le, read_u16_be],
+        [24, u32, read_u24_le, read_u24_be],
+        [32, u32, read_u32_le, read_u32_be],
+        [64, u64, read_u64_le, read_u64_be],
+        [128, u128, read_u128_le, read_u128_be],
+        [16, i16, read_i16_le, read_i16_be],
+        [32, i32, read_i32_le, read_i32_be],
+        [64, i64, read_i64_le, read_i64_be],
+        [128, i128, read_i128_le, read_i128_be]
+    );
+    gen_bit_read_ext!(@float [32, f32, read_f32_le, read_f32_be], [64, f64, read_f64_le, read_f64_be]);
+}
+
+impl<R: BitRead> BitReadExt for R {}
 
 #[derive(Debug, Clone)]
 pub struct BitBuf<T> {
     buf: T,
     index: usize,
-    pos: usize,
+    offset: usize,
+}
+impl<T: BitAdapter<Accessor = N>, N: BitAccessor> Iterator for BitBuf<T> {
+    type Item = bool;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut buf = [false];
+        if self.read(&mut buf) != 1 {
+            None
+        } else {
+            Some(buf[0])
+        }
+    }
 }
 
 impl<T> BitBuf<T> {
@@ -118,16 +109,31 @@ impl<T> BitBuf<T> {
         Self {
             buf,
             index: 0,
-            pos: 0,
+            offset: 0,
         }
     }
+    /// # Safety
+    pub unsafe fn set_index(&mut self, index: usize) {
+        self.index = index;
+    }
+
+    /// # Safety
+    pub unsafe fn set_offset(&mut self, offset: usize) {
+        self.offset = offset;
+    }
+    pub fn index(&self) -> usize {
+        self.index
+    }
+    pub fn offset(&self) -> usize {
+        self.offset
+    }
 }
-impl<T: BitStreamAdapter<Accessor = N>, N: BitAccessor> BitBuf<T> {
-    fn remain(&self) -> usize {
+impl<T: BitAdapter<Accessor = N>, N: BitAccessor> BitBuf<T> {
+    pub fn remain(&self) -> usize {
         self.len() - self.position()
     }
-    fn position(&self) -> usize {
-        self.index * N::BIT_SIZE + self.pos
+    pub fn position(&self) -> usize {
+        self.index * N::BIT_SIZE + self.offset
     }
     fn len(&self) -> usize {
         self.buf.accessor().len() * N::BIT_SIZE
@@ -135,27 +141,27 @@ impl<T: BitStreamAdapter<Accessor = N>, N: BitAccessor> BitBuf<T> {
     fn is_empty(&self) -> bool {
         self.remain() == 0
     }
-    fn slice(&self) -> &[N] {
+    pub fn accessor(&self) -> &[N] {
         self.buf.accessor()
     }
 }
 
-impl<N: BitAccessor, T: BitStreamAdapter<Accessor = N>> BitRead for BitBuf<T> {
+impl<N: BitAccessor, T: BitAdapter<Accessor = N>> BitRead for BitBuf<T> {
     fn read(&mut self, buf: &mut [bool]) -> usize {
         if self.is_empty() || buf.is_empty() {
             return 0;
         }
-        let size = copy_bits_from_numbers(buf, &self.slice()[self.index..], self.pos);
-        let pos = self.position() + size;
+        let size = copy_bits_from_accessor(buf, &self.accessor()[self.index..], self.offset);
+        let pos = BitBuf::position(self) + size;
         self.index = pos / N::BIT_SIZE;
-        self.pos = pos % N::BIT_SIZE;
+        self.offset = pos % N::BIT_SIZE;
         size
     }
 }
-fn copy_bits_from_numbers<N: BitAccessor>(bits: &mut [bool], numbers: &[N], pos: usize) -> usize {
+fn copy_bits_from_accessor<N: BitAccessor>(bits: &mut [bool], accessor: &[N], pos: usize) -> usize {
     let mut index = 0;
     let mut pos = pos;
-    for byte in numbers {
+    for byte in accessor {
         for idx in 0..N::BIT_SIZE {
             if bits.len() <= index {
                 return bits.len();
@@ -169,17 +175,4 @@ fn copy_bits_from_numbers<N: BitAccessor>(bits: &mut [bool], numbers: &[N], pos:
         }
     }
     index
-}
-
-#[test]
-fn test() {
-    // let data: [u8; 3] = [0b1010_0010, 0b0101_0101, 0b1111_0011];
-    let data = "Hello";
-    // let data = [1, 2, 3];
-    let mut buf = BitBuf::new(data);
-    assert_eq!(buf.read_u8(), Some(b'H'));
-    assert_eq!(buf.read_u8(), Some(b'e'));
-    assert_eq!(buf.read_u8(), Some(b'l'));
-    assert_eq!(buf.read_u8(), Some(b'l'));
-    assert_eq!(buf.read_u8(), Some(b'o'));
 }

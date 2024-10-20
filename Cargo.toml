@@ -1,5 +1,5 @@
 [package]
-name = "byte_cast"
+name = "bitcast"
 version = "0.1.0"
 edition = "2021"
 
@@ -7,4 +7,7 @@ edition = "2021"
 
 
 [features]
+default = [
+    "std"
+]
 std = []

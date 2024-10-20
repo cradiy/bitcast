@@ -1,6 +1,5 @@
+pub mod error;
 pub mod bit;
+#[cfg(feature = "std")]
 pub mod byte;
-
-pub trait ByteCast {
-    fn cast() -> Self;
-}
+pub use bit::*;
